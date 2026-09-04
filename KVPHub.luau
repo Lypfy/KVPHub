@@ -263,31 +263,60 @@ local function cacheSkillBySlot(slotKey)
     local backpack = player:FindFirstChild("Backpack")
     if not backpack then return nil end
     
-    -- Tìm skill theo abilitySlot
+    local foundTools = {}
+    
+    -- Lấy tất cả tool trong backpack
     for _, tool in ipairs(backpack:GetChildren()) do
         if tool:IsA("Tool") then
-            local slot = tool:FindFirstChild("abilitySlot")
-            if slot and slot:IsA("StringValue") and slot.Value == slotKey then
-                local cached = cacheSkill(tool)
-                if cached then
-                    slotSkillCache[slotKey] = cached
-                    return cached
-                end
+            table.insert(foundTools, tool)
+        end
+    end
+    
+    -- Nếu có ít nhất 2 skill, sắp xếp theo vị trí
+    if #foundTools >= 2 then
+        -- Sắp xếp để Q là skill đầu tiên, E là skill thứ 2
+        table.sort(foundTools, function(a, b)
+            local slotA = a:FindFirstChild("abilitySlot")
+            local slotB = b:FindFirstChild("abilitySlot")
+            
+            local valA = slotA and slotA:IsA("StringValue") and slotA.Value or ""
+            local valB = slotB and slotB:IsA("StringValue") and slotB.Value or ""
+            
+            -- Ưu tiên abilitySlot
+            if valA == slotKey then return true end
+            if valB == slotKey then return false end
+            
+            -- Nếu không có abilitySlot, dùng vị trí
+            return false
+        end)
+    end
+    
+    -- Tìm skill theo abilitySlot
+    for _, tool in ipairs(foundTools) do
+        local slot = tool:FindFirstChild("abilitySlot")
+        if slot and slot:IsA("StringValue") and slot.Value == slotKey then
+            local cached = cacheSkill(tool)
+            if cached then
+                cached.abilityKey = slotKey
+                slotSkillCache[slotKey] = cached
+                print("[Auto Skill] Found skill for slot", slotKey, ":", tool.Name)
+                return cached
             end
         end
     end
     
-    -- Nếu không tìm thấy theo abilitySlot, thử tìm theo tên
-    for _, tool in ipairs(backpack:GetChildren()) do
-        if tool:IsA("Tool") then
-            local config = getSkillConfig(tool.Name)
-            if config.abilityKey == slotKey then
-                local cached = cacheSkill(tool)
-                if cached then
-                    slotSkillCache[slotKey] = cached
-                    return cached
-                end
-            end
+    -- Nếu không có abilitySlot, dùng vị trí trong backpack
+    -- Q = skill đầu tiên, E = skill thứ 2
+    local slotIndex = (slotKey == "q") and 1 or 2
+    
+    if #foundTools >= slotIndex then
+        local tool = foundTools[slotIndex]
+        local cached = cacheSkill(tool)
+        if cached then
+            cached.abilityKey = slotKey
+            slotSkillCache[slotKey] = cached
+            print("[Auto Skill] Found skill for slot", slotKey, "by position:", tool.Name)
+            return cached
         end
     end
     
@@ -299,10 +328,7 @@ local function getCachedSkillBySlot(slotKey)
     -- Kiểm tra cache còn hợp lệ không
     local cached = slotSkillCache[slotKey]
     if cached and cached.tool and cached.tool.Parent and cached.tool:IsA("Tool") then
-        -- Kiểm tra cooldown
-        if cached.cooldown and cached.cooldown.Value > 0 then
-            return nil  -- Đang hồi chiêu
-        end
+        -- BỎ KIỂM TRA COOLDOWN ở đây, để cho CastSkillSlotOptimized kiểm tra
         return cached
     end
     
@@ -476,9 +502,23 @@ local function autoSkillLoop()
         end
         
         -- Xóa skill không còn tồn tại
+        local cacheChanged = false
         for skillName in pairs(skillCache) do
             if not currentSkillNames[skillName] then
                 skillCache[skillName] = nil
+                cacheChanged = true
+            end
+        end
+        
+        -- Nếu cache thay đổi, reset slot cache
+        if cacheChanged then
+            slotSkillCache = {
+                q = nil,
+                e = nil
+            }
+            -- Tìm lại skill cho từng slot
+            for slotKey in pairs(slotSkillCache) do
+                cacheSkillBySlot(slotKey)
             end
         end
         
@@ -495,7 +535,9 @@ local function autoSkillLoop()
                     CastSkillSlotOptimized(slotKey, slotKey == "q" and 1 or 2)
                 end
             else
+                -- Cache không hợp lệ, tìm lại
                 slotSkillCache[slotKey] = nil
+                cacheSkillBySlot(slotKey)
             end
         end
     end)
@@ -556,8 +598,8 @@ local rootPart = character:WaitForChild("HumanoidRootPart")
 
 -- Configuration
 local CONFIG = {
-    ATTACK_RANGE = 12,
-    DETECTION_RANGE = 500,
+    ATTACK_RANGE = 40,
+    DETECTION_RANGE = 1000,
     FOLLOW_DISTANCE = 5,
     PATH_UPDATE_INTERVAL = 0.5,
     ATTACK_COOLDOWN = 0.2,
@@ -861,7 +903,7 @@ tab:CreateSlider({
 tab:CreateSlider({
     name = "Attack Range",
     description = "Distance to start attacking enemies",
-    range = { 5, 30 },
+    range = { 5, 100 },
     increment = 1,
     value = CONFIG.ATTACK_RANGE,
     suffix = " studs",
