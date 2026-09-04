@@ -595,15 +595,18 @@ local localPlayer = players.LocalPlayer
 local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
 local humanoid = character:WaitForChild("Humanoid")
 local rootPart = character:WaitForChild("HumanoidRootPart")
+local stuckTimer = 0
+local lastDistance = 0
+local stuckDetected = false
 
 -- Configuration
 local CONFIG = {
-    ATTACK_RANGE = 40,
+    ATTACK_RANGE = 65,
     DETECTION_RANGE = 1000,
     FOLLOW_DISTANCE = 5,
     PATH_UPDATE_INTERVAL = 0.5,
     ATTACK_COOLDOWN = 0.2,
-    WAYPOINT_REACHED_DISTANCE = 3,
+    WAYPOINT_REACHED_DISTANCE = 8,
     MAX_SPEED = 16,
     BARRIER_SEARCH_RADIUS = 100,
 }
@@ -735,9 +738,17 @@ local function createPathToPosition(targetPosition)
     end
 end
 
--- Follow path
+-- Follow path (cải thiện xuống dốc)
+local stuckTimer = 0
+local lastDistance = 0
+local stuckThreshold = 5 -- giây (tăng lên)
+
 local function followPath(path)
     if not path or path.Status ~= Enum.PathStatus.Success then
+        return false
+    end
+    
+    if not rootPart or not humanoid then
         return false
     end
     
@@ -746,27 +757,50 @@ local function followPath(path)
         return false
     end
     
+    if pathIndex > #waypoints then
+        pathIndex = 1
+        return false
+    end
+    
     local waypoint = waypoints[pathIndex]
     if not waypoint then
+        pathIndex = 1
         return false
     end
     
     local targetPos = waypoint.Position
-    local distance = (rootPart.Position - targetPos).Magnitude
+    if not targetPos then
+        return false
+    end
     
+    local currentPos = rootPart.Position
+    if not currentPos then
+        return false
+    end
+    
+    local distance = (currentPos - targetPos).Magnitude
+    if not distance then
+        return false
+    end
+    
+    -- Chỉ set tốc độ khi bắt đầu di chuyển, không set mỗi frame
     if distance > CONFIG.WAYPOINT_REACHED_DISTANCE then
-        humanoid:MoveTo(targetPos)
+        -- Nếu khoảng cách > 2 studs, mới gọi MoveTo để tránh giật
+        if distance > 2 then
+            humanoid:MoveTo(targetPos)
+        end
+        -- Giữ tốc độ luôn ở MAX_SPEED
         humanoid.WalkSpeed = CONFIG.MAX_SPEED
         return false
     else
+        -- Đã đến gần waypoint, chuyển tiếp
         pathIndex = pathIndex + 1
         if pathIndex > #waypoints then
-            debugLog("Reached destination", "INFO")
+            debugLog("Path complete!", "INFO")
             return true
         end
+        return false
     end
-    
-    return false
 end
 
 -- Perform attack
@@ -825,17 +859,29 @@ local function updatePathfinding()
         currentTarget = enemy
         local targetPosition = enemy.HumanoidRootPart.Position
         
-        local currentTime = tick()
-        if currentTime - lastPathUpdate >= CONFIG.PATH_UPDATE_INTERVAL then
-            currentPath = createPathToPosition(targetPosition)
-            pathIndex = 1
-            lastPathUpdate = currentTime
+        local lookDirection = (targetPosition - rootPart.Position).Unit
+        if lookDirection.Magnitude > 0 then
+            rootPart.CFrame = CFrame.new(rootPart.Position, rootPart.Position + lookDirection)
         end
         
         if enemyDistance > CONFIG.ATTACK_RANGE then
+            if currentPath == nil then
+                debugLog("Creating new path to enemy", "INFO")
+                currentPath = createPathToPosition(targetPosition)
+                pathIndex = 1
+                lastPathUpdate = tick()
+                stuckTimer = 0
+                lastDistance = 0
+                stuckDetected = false
+            end
+            
             if currentPath then
                 local pathComplete = followPath(currentPath)
-                if pathComplete then
+                if pathComplete or stuckDetected then
+                    if stuckDetected then
+                        debugLog("Recreating path due to stuck", "WARNING")
+                        stuckDetected = false
+                    end
                     currentPath = nil
                 end
             else
@@ -848,21 +894,34 @@ local function updatePathfinding()
             performAttack(enemy)
         end
     else
+        -- Checkpoint logic tương tự
         local checkpoint = findNearestCheckpoint()
         if checkpoint then
             currentTarget = nil
             local checkpointPosition = checkpoint.Position
             
-            local currentTime = tick()
-            if currentTime - lastPathUpdate >= CONFIG.PATH_UPDATE_INTERVAL then
+            local lookDirection = (checkpointPosition - rootPart.Position).Unit
+            if lookDirection.Magnitude > 0 then
+                rootPart.CFrame = CFrame.new(rootPart.Position, rootPart.Position + lookDirection)
+            end
+            
+            if currentPath == nil then
+                debugLog("Creating new path to checkpoint", "INFO")
                 currentPath = createPathToPosition(checkpointPosition)
                 pathIndex = 1
-                lastPathUpdate = currentTime
+                lastPathUpdate = tick()
+                stuckTimer = 0
+                lastDistance = 0
+                stuckDetected = false
             end
             
             if currentPath then
                 local pathComplete = followPath(currentPath)
-                if pathComplete then
+                if pathComplete or stuckDetected then
+                    if stuckDetected then
+                        debugLog("Recreating path due to stuck", "WARNING")
+                        stuckDetected = false
+                    end
                     currentPath = nil
                     humanoid:MoveTo(rootPart.Position)
                     humanoid.WalkSpeed = 0
@@ -872,7 +931,6 @@ local function updatePathfinding()
                 humanoid.WalkSpeed = CONFIG.MAX_SPEED
             end
         else
-            -- Only log this occasionally
             if tick() - lastLogTime >= 5 then
                 debugLog("No targets or checkpoints found, waiting...", "INFO")
                 lastLogTime = tick()
@@ -919,27 +977,17 @@ tab:CreateToggle({
     callback = function(value)
         pathfindingEnabled = value
         
-        if pathfindingEnabled then
-            debugLog("=====================================", "INFO")
-            debugLog("PATHFINDING SYSTEM ENABLED", "SUCCESS")
-            debugLog("=====================================", "INFO")
-            debugLog(string.format("Attack Range: %.2f", CONFIG.ATTACK_RANGE), "INFO")
-            debugLog(string.format("Detection Range: %.2f", CONFIG.DETECTION_RANGE), "INFO")
-            debugLog(string.format("Path Update Interval: %.2fs", CONFIG.PATH_UPDATE_INTERVAL), "INFO")
-            debugLog(string.format("Attack Cooldown: %.2fs", CONFIG.ATTACK_COOLDOWN), "INFO")
-            
+        if pathfindingEnabled then          
             currentPath = nil
             currentTarget = nil
             pathIndex = 1
             lastPathUpdate = 0
             
             if not pathfindingConnection then
-                debugLog("Starting pathfinding connection", "INFO")
                 pathfindingConnection = runService.Heartbeat:Connect(updatePathfinding)
             end
             
             if not attackLoopConnection then
-                debugLog("Starting attack loop connection", "INFO")
                 attackLoopConnection = runService.Heartbeat:Connect(function()
                     if pathfindingEnabled and currentTarget then
                         performAttack(currentTarget)
@@ -947,31 +995,24 @@ tab:CreateToggle({
                 end)
             end
         else
-            debugLog("=====================================", "INFO")
-            debugLog("PATHFINDING SYSTEM DISABLED", "WARNING")
-            debugLog("=====================================", "INFO")
             
             if pathfindingConnection then
-                debugLog("Disconnecting pathfinding", "INFO")
                 pathfindingConnection:Disconnect()
                 pathfindingConnection = nil
             end
             
             if attackLoopConnection then
-                debugLog("Disconnecting attack loop", "INFO")
                 attackLoopConnection:Disconnect()
                 attackLoopConnection = nil
             end
             
             if humanoid then
-                debugLog("Stopping character movement", "INFO")
                 humanoid:MoveTo(rootPart.Position)
                 humanoid.WalkSpeed = 16
             end
             
             currentPath = nil
             currentTarget = nil
-            debugLog("System clean up complete", "SUCCESS")
         end
     end,
 })
@@ -989,6 +1030,179 @@ localPlayer.CharacterAdded:Connect(function(newCharacter)
 end)
 
 debugLog("Pathfinding system loaded successfully!", "SUCCESS")
+
+-- ===== PATHFINDING VISUALIZATION =====
+local visualizationEnabled = false
+local visualizationParts = {}
+local lastVisualizedPath = nil
+local lastVisualizationUpdate = 0
+local visualizationConnection = nil
+
+-- Create visualization parts for path
+local function createPathVisualization(path)
+    -- Clear old visualization
+    for _, part in ipairs(visualizationParts) do
+        if part and part.Parent then
+            pcall(function() part:Destroy() end)
+        end
+    end
+    visualizationParts = {}
+    
+    if not visualizationEnabled or not path then
+        return
+    end
+    
+    local waypoints = path:GetWaypoints()
+    if #waypoints == 0 then
+        return
+    end
+    
+    -- Create waypoint markers
+    for i, waypoint in ipairs(waypoints) do
+        local part = Instance.new("Part")
+        part.Size = Vector3.new(1.5, 1.5, 1.5)
+        part.Position = waypoint.Position
+        part.Anchored = true
+        part.CanCollide = false
+        part.Material = Enum.Material.Neon
+        part.Shape = Enum.PartType.Ball
+        
+        if waypoint.Action == Enum.PathWaypointAction.Jump then
+            part.BrickColor = BrickColor.new("Bright yellow")
+        else
+            part.BrickColor = BrickColor.new("Bright green")
+        end
+        
+        part.Transparency = 0.3
+        part.Parent = workspace
+        table.insert(visualizationParts, part)
+    end
+    
+    -- Create line between waypoints
+    for i = 1, #waypoints - 1 do
+        local startPos = waypoints[i].Position
+        local endPos = waypoints[i + 1].Position
+        local distance = (endPos - startPos).Magnitude
+        
+        if distance > 0 then
+            local linePart = Instance.new("Part")
+            linePart.Size = Vector3.new(0.5, 0.5, distance)
+            linePart.Position = (startPos + endPos) / 2
+            linePart.Anchored = true
+            linePart.CanCollide = false
+            linePart.Material = Enum.Material.Neon
+            linePart.BrickColor = BrickColor.new("Bright blue")
+            linePart.Transparency = 0.4
+            
+            local direction = (endPos - startPos).Unit
+            linePart.CFrame = CFrame.lookAt(linePart.Position, linePart.Position + direction)
+            
+            linePart.Parent = workspace
+            table.insert(visualizationParts, linePart)
+        end
+    end
+    
+    lastVisualizedPath = path
+end
+
+-- Update indicator for current waypoint
+local function updateVisualizationOnWaypoint()
+    if not visualizationEnabled or not currentPath then
+        return
+    end
+    
+    local currentTime = tick()
+    if currentTime - lastVisualizationUpdate < 2 then
+        return
+    end
+    lastVisualizationUpdate = currentTime
+    
+    local waypoints = currentPath:GetWaypoints()
+    if #waypoints == 0 or pathIndex > #waypoints then
+        return
+    end
+    
+    -- Remove old indicator (red)
+    for i = #visualizationParts, 1, -1 do
+        local part = visualizationParts[i]
+        if part and part.Parent and part.BrickColor == BrickColor.new("Bright red") then
+            pcall(function() part:Destroy() end)
+            table.remove(visualizationParts, i)
+        end
+    end
+    
+    local waypoint = waypoints[pathIndex]
+    if waypoint then
+        local indicator = Instance.new("Part")
+        indicator.Size = Vector3.new(2.5, 2.5, 2.5)
+        indicator.Position = waypoint.Position
+        indicator.Anchored = true
+        indicator.CanCollide = false
+        indicator.Material = Enum.Material.Neon
+        indicator.BrickColor = BrickColor.new("Bright red")
+        indicator.Shape = Enum.PartType.Ball
+        indicator.Transparency = 0.2
+        indicator.Parent = workspace
+        table.insert(visualizationParts, indicator)
+    end
+end
+
+-- Visualization loop (runs separately from movement)
+local function visualizationLoop()
+    if not visualizationEnabled then
+        return
+    end
+    if currentPath then
+        updateVisualizationOnWaypoint()
+    end
+end
+
+-- Toggle for visualization (only ONE toggle)
+tab:CreateToggle({
+    name = "Show Path Visualization",
+    description = "Show path waypoints and lines",
+    value = false,
+    callback = function(value)
+        visualizationEnabled = value
+        
+        if not visualizationEnabled then
+            -- Clear all visualization parts
+            for _, part in ipairs(visualizationParts) do
+                if part and part.Parent then
+                    pcall(function() part:Destroy() end)
+                end
+            end
+            visualizationParts = {}
+            lastVisualizedPath = nil
+            
+            if visualizationConnection then
+                visualizationConnection:Disconnect()
+                visualizationConnection = nil
+            end
+        else
+            -- Show current path if exists
+            if currentPath then
+                createPathVisualization(currentPath)
+            end
+            -- Start connection
+            if visualizationConnection then
+                visualizationConnection:Disconnect()
+                visualizationConnection = nil
+            end
+            visualizationConnection = runService.Heartbeat:Connect(visualizationLoop)
+        end
+    end,
+})
+
+-- Override createPathToPosition to create visualization when path is created
+local originalCreatePath = createPathToPosition
+createPathToPosition = function(targetPosition)
+    local path = originalCreatePath(targetPosition)
+    if visualizationEnabled and path then
+        createPathVisualization(path)
+    end
+    return path
+end
 
 -- ===== QUIT UI =====
 tab:CreateButton({
